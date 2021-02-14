@@ -1,0 +1,1334 @@
+---
+title: 'Second life for books: What kind of books people give away?'
+output:
+  html_document: 
+    fig_caption: yes
+  pdf_document: default
+---
+
+In this notebook, I explore relationships between two book rating datasets. One of them comes from BookCrossing.com, a website which encourages the act of "book crossing" - releasing books into the wild for a stranger to pick up - and provides means to track books' journeys among its users, including their ratings. This dataset was released by Cai-Nicolas Ziegler and is freely available on [his website](http://www2.informatik.uni-freiburg.de/~cziegler/BX/). The second one comes from Goodreads.com - one of the largest book rating and review websites. This dataset was collected by a group of researchers in University of California San Diego and is available on a [dedicated website](https://sites.google.com/eng.ucsd.edu/ucsdbookgraph/home), too.
+
+I start off with overall exploration of the datasets and ratings in them. I then do some additional work with author-level and genre data available, and finally turn to answer the main questions of this notebook:
+
+* What makes a book more likely to be shared on Book Crossing?
+* Do people tend to give away books they like less, on average (as evidenced by Goodreads ratings)?
+
+Along the way, I play around with techniques spanning from simple t-tests and K-means to propensity score-based setups for causal inference.
+
+
+```{r setup, echo=F}
+
+## For knitting: rmarkdown::render('~/coding/MIT explorations/books.Rmd', params = list(envir = globalenv()))
+
+set.seed(18610410)
+library(data.table)
+library(dtplyr)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(vroom)
+library(jsonlite)
+library(RColorBrewer)
+library(caret)
+library(gridExtra)
+library(grid)
+library(cluster)
+library(knitr)
+library(kableExtra)
+library(stringi)
+library(parallel)
+library(sgd)
+library(ggrepel)
+library(scales)
+crossing_path = "/media/data/books/bx/"
+goodreads_path = "/media/data/books/goodreads/"
+rds_path = "/media/data/books/temp-RDS/"
+
+#Vectorized ISBN validation function
+#Based on the algorithm as defined @ https://en.wikipedia.org/wiki/International_Standard_Book_Number#ISBN-10_check_digits
+check_isbn = function(isbn) {
+  #check for length validity
+  results = str_length(isbn) == 10
+  to_validate = isbn[which(results)]
+  #if there are valid strings - proceed
+  if (length(to_validate) > 0) {
+    digits = str_split(to_validate, "")
+    validations = sapply(
+      digits, 
+      function(x) {
+        #replace last "X"'s with 10
+        if(x[10] == "X") x[10] = 10 
+        #convert to numeric vectors
+        validity = all(x %in% 0:10, T)
+        if (validity) {
+          v = as.numeric(x) 
+          #calculate products according to ISBN validation formula
+          t = 0
+          s = 0
+          for (i in 1:10) {
+            t = t + v[i]
+            s = s + t
+          }
+          #return if their mod 11 is 0
+          return((s %% 11) == 0)
+          
+          #products = mapply(function (x, y) x*y, 10:1, v) <- original version, siginificantly slower due to multiplication
+          #return((sum(products) %% 11) == 0)  
+        } else {
+          return(FALSE)
+        }
+      }
+    )
+    # update results based on validation output
+    results[which(results)] = results[which(results)] & validations
+    #return
+  }
+  results
+}
+
+#convert ISBN13 to ISBN10
+convert_to_isbn10 = function(isbn13) {
+  #check for length validity
+  results = (str_length(isbn13) == 13) & (str_sub(isbn13, 1, 3) == "978")
+  to_validate = isbn13[which(results)]
+  #if there are valid strings - proceed
+  if (length(to_validate) > 0) {
+    digits = str_split(str_sub(to_validate, 4,12), "")
+    validations = sapply(
+      digits,
+      function(x) {
+        #take the relevant digits
+        #convert to numeric vectors
+        validity = all(x %in% 0:9, T)
+        if (validity) {
+          v = as.numeric(x)
+          #calculate products according to ISBN validation formula
+          t = 0
+          s = 0
+          for (i in 1:9) {
+            t = t + v[i]
+            s = s + t
+          }
+          check_digit = (11 - ((s + t) %% 11)) %% 11
+          if (check_digit == 10) check_digit = "X"
+          return(str_c(stri_flatten(x),check_digit))
+        } else {
+          return(NA)
+        }
+      }
+    )
+    # update results based on validation output
+    results[which(results)] = validations
+    results[results == F] = NA
+    #return
+  }
+  results
+}
+
+#Converts valid "numeric strings" into integers, NA for others (without coercion)
+#Vectorized
+convert_to_integer = function (string) {
+  str_chars = str_split(string, "")
+  sapply(str_chars, function(x) {
+    if (all(x %in% 0:9, T)) return(as.integer(stri_flatten(x)))
+    else NA
+  })
+}
+
+#Creates a pretty dataset overview with key metrics
+dataset_overview = function(dataset) {
+  bind_rows(
+  dataset %>% summarize(across(everything(), function(x) {n_distinct(x)})) %>% mutate_all(as.character),
+  dataset %>% summarize(across(everything(), function(x) {length(x) - n_distinct(x) - sum(is.na(x)) - ifelse(sum(is.na(x)) > 1,-1,0)})) %>% mutate_all(as.character),
+  dataset %>% summarize(across(everything(), function(x) {sum(is.na(x))})) %>% mutate_all(as.character),
+  dataset %>% summarize(across(everything(), function(x) {sum(x == 0 | x == "", na.rm = T)})) %>% mutate_all(as.character),
+  dataset %>% summarize(across(everything(), min, na.rm=T)) %>% mutate_all(as.character),
+  dataset %>% summarize(across(where(is.numeric), mean, na.rm=T)) %>% mutate_all(as.character),
+  dataset %>% summarize(across(where(is.numeric), median, na.rm=T)) %>% mutate_all(as.character),
+  dataset %>% summarize(across(everything(), max, na.rm = T)) %>% mutate_all(as.character)
+) %>% t() %>% 
+  kable(
+    col.names = c("# unique", "# non-unique",  "# missing", "# 0/blank", "Min value", "Mean value", "Median value", "Max value"), 
+    caption="Dataset overview", 
+    format="html"
+  ) %>%
+  column_spec(1, bold = T, border_right = T) %>%
+  kable_styling(bootstrap_options = "striped", full_width = T) %>%
+  footnote(general_title = "Total records in the dataset: ", general = nrow(dataset), footnote_as_chunk = T)
+}
+
+#Shorthand function for t-testing between two groups in a dataset
+t_test = function(tb, col, groups, grouping_var) {
+  tb = as.data.table(tb)
+  r = t.test(
+    tb[tb[[grouping_var]] == groups[1], ..col],
+    tb[tb[[grouping_var]] == groups[2], ..col],
+  )
+  r$group_labels = groups
+  r$group_var = grouping_var
+  r
+}
+
+#nice output of a t-test
+present_t_result = function(l, t, labels = NULL) {
+  result = 
+    list(
+    "Test"=l
+  )
+  if (is_null(labels)) {
+    result[["group 1"]] = as.character(t$group_labels[1])
+    result[["group 2"]] = as.character(t$group_labels[2])
+  } else {
+    result[["group 1"]] = as.character(labels[1])
+    result[["group 2"]] = as.character(labels[2])
+  }
+  result[["estimate 1"]] = round(t$estimate[[1]],4)
+  result[["estimate 2"]] = round(t$estimate[[2]], 4)
+  result[["mean difference"]] = round((t$estimate[[1]] - t$estimate[[2]]), 4)
+  result[["p.value"]]=round(t$p.value, 4)
+  result[["statistic"]]=round(t$statistic,4)
+  as_tibble(result)
+}
+
+#Shorthand function of t_test + nice output
+t_nice = function (name, tb, col, groups, grouping_var, labels = NULL) {
+  present_t_result(name, t_test(tb, col, groups, grouping_var), labels)
+}
+
+#percent formatting // credit: https://statisticsglobe.com/format-number-as-percentage-in-r
+percent <- function(x, digits = 2, format = "f", ...) {
+  paste0(formatC(x * 100, format = format, digits = digits, ...), "%")
+}
+
+recall <- function(matrix) {
+# true positive
+    tp <- matrix[2, 2]# false positive
+    fn <- matrix[2, 1]
+    return (tp / (tp + fn))
+}
+
+precision <- function(matrix) {
+	# True positive
+    tp <- matrix[2, 2]
+	# false positive
+    fp <- matrix[1, 2]
+    return (tp / (tp + fp))
+}
+
+accuracy = function(cf) {
+  sum(diag(cf)) / sum(cf)
+}
+
+f1 = function(cf) {
+  2 * ((precision(cf) * recall(cf)) / (precision(cf) + recall(cf)))
+}
+
+```
+# Data loading and clean-up
+## Goodreads dataset
+
+Let's start off by loading the the Goodreads books dataset. Note that this dataset has been preprocessed to be reduced in size (see Appendix A for details), keeping all records but removing attributes that will not be used in this analysis. 
+
+The dataset contains 2.4M records in total but quite a few of them suffer from data quality issues. Nearly 1M of them do not have an ISBN10 (which will make it impossible to match them to Book Crossing data), there are 24k invalid ISBN entries (implementation of the ISBN verification code is included in the setup chunk), and there are quite a few missing / incorrect records for publication year (max is 65,535, presumably.. BC?). On the other hand, the other key variables that will be useful in my analysis (book_id, text_reviews_count, average_rating, ratings_count) all appear to be relatively tidy. The book_id variable is the primary key of this dataset.
+
+At the same time, the dataset includes an ISBN13 identifier, and a significant chunk of records that do not have a valid ISBN10 (~250k records) entries have a ISBN13 number than can be converted back to ISBN10. I will recalculate ISBN10 for such records to increase the likelihood of matching more records with Book Crossing dataset (which only has ISBN10 identifiers)
+
+At this stage, the only changes to the data I am performing is:
+* Converting publication years to valid integers (with all other values set to NA).
+* Assigning a calculated ISBN number to books that are missing one and have a valid ISBN13 number starting with 978 (which enables conversion). This allows adding another ~250k valid ISBN10 numbers.
+* Assigning an artificial ISBN number to all the remaining books with no ISBN10 number (so that this column could be used as a key going forward)
+* Removing duplicate entries
+
+There are ~72 ISBNs that have non-unique attributes, which, upon inspection appear to be different editions of the same book released under one ISBN. While this should not theoretically happen, it [does in practice](https://en.wikipedia.org/wiki/International_Standard_Book_Number#Errors_in_usage). In this particular case, it is likely that Goodreads treats the editions of the book as "not the same book", and so I will keep it in the dataset accordingly.
+
+Finally, I check whether there are significant rating differences between books with valid and invalid ISBNs. This appears to be the case, with invalid ISBN books having a 0.05 higher rating, on average, than the valid ISBN books. This will be something to keep in mind when comparing the dataset to the Book Crossing one (as invalid ISBN books, by definition, will be impossible to match).
+```{r GR_load_books, echo=F, eval=F}
+#load data
+GR_books = read_csv(
+  paste0(goodreads_path, "goodreads_parsed_books.csv"),
+  col_names = c("ISBN", "text_reviews_count", "average_rating", "ISBN13", "pub_year", "book_id", "ratings_count", "work_id"),
+  col_types = list("c", "i", "-", "d", "c", "i", "i", "i", "i"),
+  skip = 1) %>%
+  mutate(ISBN = str_to_upper(ISBN))
+
+#data clean-up
+GR_books_clean = GR_books %>% lazy_dt() %>%
+  mutate(pub_year = convert_to_integer(pub_year)) %>%
+  mutate(pub_year = ifelse(pub_year == 0, NA, pub_year)) %>%
+  mutate(valid_ISBN = check_isbn(ISBN)) %>%
+  mutate(valid_ISBN = ifelse(is.na(ISBN), F, valid_ISBN)) %>%
+  mutate(ISBN = ifelse(is.na(ISBN), paste("ISBN-", row_number()), ISBN)) %>% 
+  as.data.table()
+
+GR_books_clean[valid_ISBN == F & ((str_length(ISBN13) == 13) & (str_sub(ISBN13, 1, 3) == "978")), new_ISBN := convert_to_isbn10(ISBN13) ]
+GR_books_clean[!is.na(new_ISBN), ISBN := new_ISBN]
+GR_books_clean[!is.na(new_ISBN), valid_ISBN := T]
+GR_books_clean[, new_ISBN := NULL]
+  
+setkey(GR_books_clean, ISBN)
+
+#checks for ISBN validity
+GR.t1 = 
+  GR_books %>% lazy_dt() %>% filter(!is.na(ISBN)) %>% 
+  mutate(valid_ISBN = check_isbn(ISBN)) %>% 
+  group_by(valid_ISBN) %>% summarize(n = n()) %>%
+  as_tibble()
+
+#checks for duplicate ISBNs with non-unique attributes
+GR.t2 = 
+  GR_books %>% lazy_dt() %>% unique() %>% group_by(ISBN) %>% summarize(n = n()) %>% 
+  filter(n > 1 & !is.na(ISBN)) %>% 
+  inner_join(GR_books, by="ISBN") %>% 
+  select(-n) %>% as_tibble()
+
+#dataset overview
+GR.d = dataset_overview(GR_books)
+
+#significance test
+GR.ttest = 
+  t_nice("Difference in means - ISBN validity", GR_books_clean, "average_rating", c(T,F), "valid_ISBN", c("Valid ISBN", "Invalid ISBN")) 
+```
+
+```{r GR_books_tables, echo=F}
+#dataset overview
+GR.d
+
+#checks for ISBN validity
+GR.t1 %>%
+  kable(caption="Validity of ISBN strings in the dataset", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+#checks for duplicate ISBNs with non-unique attributes
+GR.t2[1:10, ] %>%
+  kable(caption = "Duplicate ISBN with non-unique attributes", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+GR.ttest %>%
+  kable(caption = "Significance test results", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+```
+```{r cleanup, echo=F, eval=F}
+rm(GR_books)
+```
+
+## Book Crossing book dataset - books
+The BX dataset has 271k books in total, and is largely a tidy dataset: missing / empty values are limited to publication years only (4.6k values equal to 0, which I interpret as a missing value and replace accordingly). The ISBN data, however, clearly includes invalid ISBN strings. Upon a verification, it turns out this is limited to just over 100 ISBN entries.
+
+Additionally, the dataset includes some duplicate ISBN's included. Upon further analysis, it seems that all duplicate ISBNs end with an "X" indicating a potential error in the original data gathering exercise. I am exluding the duplicates from my analysis, including one duplicate entry where the same ISBN has varying titles.
+
+Finally, I will note that the dataset includes some books written after the dataset was collected in late 2004. Whether it is time travellers or data quality issues will remain a topic for another analysis.
+```{r BX_books_load, echo=F, eval=F}
+BX_books = paste0(crossing_path, "BX-Books.csv") %>% 
+  read_delim(
+    delim=";", 
+    col_names = c("ISBN", "Title", "Author", "Year-Of-Publication"),
+    col_types = list("c", "c", "c", "?", "-", "-", "-", "-"), #skipping irrelevant columns for publisher and Amazon URLs
+    escape_backslash=TRUE, 
+    escape_double = F,
+    locale = locale(encoding="ISO-8859-1"),
+    skip = 1
+  ) %>%
+  mutate(ISBN = str_to_upper(ISBN))
+
+#overall dataset size
+BXB.d = dataset_overview(BX_books)
+
+#Validity of ISBNs in the dataset
+BXB.tb1 = 
+BX_books %>% lazy_dt() %>% mutate(valid_ISBN = check_isbn(ISBN)) %>% 
+  group_by(valid_ISBN) %>% summarize(n = n()) %>% as_tibble()
+
+#Duplicate ISBNs (by last character)
+BXB.tb2 = 
+  BX_books %>% group_by(ISBN) %>% summarize(n = n(), .groups="drop_last") %>% 
+    filter(n > 1) %>% .$ISBN %>% str_sub(-1) %>% table() %>% as_tibble()
+
+#Duplicate ISBNs that have non-unique values in the other fields
+BXB.tb3 =
+  BX_books %>% unique() %>% group_by(ISBN) %>% summarize(n = n(), .groups="drop_last") %>% 
+  filter(n > 1) %>% 
+  inner_join(BX_books, by="ISBN") %>% 
+  select(-n) %>% as_tibble()
+
+#update of the dataset for all the data quality issues found (keeping invalid ISBNs for now)
+BX_books_clean = 
+  BX_books %>% 
+  unique() %>% 
+  filter(!(Title == "Key of Light (Key Trilogy (Paperback))" & ISBN == "051513628X")) %>% 
+  mutate(`Year-Of-Publication` = convert_to_integer(`Year-Of-Publication`)) %>%
+  mutate(`Year-Of-Publication` = ifelse(`Year-Of-Publication` == 0, NA, `Year-Of-Publication`)) %>%
+  mutate(valid_ISBN = check_isbn(ISBN)) %>%
+  as.data.table()
+
+setkey(BX_books_clean, ISBN)
+```
+
+```{r BX_books, echo=F}
+#overall dataset size
+BXB.d
+
+#Validity of ISBNs in the dataset
+BXB.tb1 %>%
+  kable(caption="Validity of ISBN strings in the dataset", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+#Duplicate ISBNs (by last character)
+BXB.tb2 %>% 
+  kable(caption="Last character of duplicate ISBNs", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+#Duplicate ISBNs that have non-unique values in the other fields
+BXB.tb3 %>%
+  kable(caption = "Duplicate ISBN with non-unique attributes", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+```
+## Book Crossing book dataset - ratings
+Book Crossing rating dataset is stored separately (incl. user-level rating information). It includes over 1.1M ratings for 340k books from 105k users. It has more unique books than the books dataset itself. As my key focus of analysis is ratings, I will include all "unseen" ISBNs into the combined BX dataset, too. 
+
+Otherwise, the dataset is tidy, with no missing values. One important thing to note is that *Book-Rating* field includes over 716k 0-value entries (whereas generally rating is 1-10). Based on the information provided together with the dataset, these are "implicit" ratings, which I interpret as "unknown" ratings (i.e. a user had a book but did not leave an explicit rating). While it carries information that a user possessed a book, for my purposes (which are focused on ratings themselves) I will exclude these entries.
+
+Finally, I merge the ratings data with the book dataset in order to carry on with the analysis. To make it comparable to the Goodreads dataset, a count of ratings (excl. 0-values) and a mean rating is included for every book. As illustrated below, the overlap between the datasets is not full. Roughly 44% of the books do not have any associated ratings, and there are 30k valid ISBNs included in the rating data that were not included in the book dataset.
+
+To understand how these dynamics affect the dataset I perform a couple of significance tests:
+* Difference in mean ratings between books with valid and invalid ISBNs (null hypothesis of no difference is not rejected at 5% signifance level). This implies my findings should not be materially affected by inability to match invalid ISBNs further in the analysis.
+* Difference in mean ratings between books included only in ratings dataset vs. both books and ratings dataset (null hypothesis of no difference is rejected at 5% signifance level). Books included in the ratings dataset only appear to have a lower rating, on average (7.34 vs. 7.52). Because there is a significant difference, I will keep the "ratings-only" books in the dataset further in the analysis.
+```{r BX_ratings_load, echo=F, eval=F}
+#read in the data
+BX_ratings = 
+  paste0(crossing_path, "BX-Book-Ratings.csv") %>% 
+  read_delim(delim=";", escape_backslash=TRUE, escape_double = F, locale = locale(encoding="ISO-8859-1"))
+
+#summarize to ISBN-level dataset
+BX_ISBN_ratings = 
+  BX_ratings %>% lazy_dt() %>% 
+  filter(`Book-Rating` != 0) %>% 
+  group_by(ISBN) %>% summarize(mean_rating = mean(`Book-Rating`), rating_count = n()) %>% as.data.table()
+
+setkey(BX_ISBN_ratings, ISBN)
+
+#merge the the ratings information with the books information & source detail
+BX = merge(BX_ISBN_ratings, BX_books_clean, all=T)
+BX[, source := ifelse(is.na(rating_count), "BX-books", ifelse(is.na(Author), "BX-ratings", "BX-joint"))]
+setkey(BX, ISBN)
+
+#add ISBN validation information where it is missing
+BX[is.na(valid_ISBN), valid_ISBN := check_isbn(ISBN)]
+
+#cleanup
+rm(BX_ISBN_ratings)
+rm(BX_books_clean)
+rm(BX_books)
+write_rds(BX_ratings, paste0(rds_path, "BX_ratings.rds"))
+write_rds(BX, paste0(rds_path, "BX.rds"))
+
+#get the dataset overview
+BXR.overview = dataset_overview(BX_ratings)
+
+#visualize ISBN consistency / availability
+BXR.ISBNs = BX[, .N, by=list(source, valid_ISBN)] %>% 
+  ggplot(aes(x=source, y=N, fill=valid_ISBN)) + geom_col(position="dodge") + 
+  geom_text(aes(label=N, y= N + 2000), position = position_dodge(0.9), vjust = 0) +
+  ggtitle("ISBN validity and overlap between BX books and ratings dataset") + ylab("Frequency") + 
+  scale_fill_discrete(name = "ISBN is valid") + theme(legend.position = "bottom")
+
+BXR.ISBNsTests =
+bind_rows(
+  t_nice("Difference in means - ISBN validity", BX, "mean_rating", c(T,F), "valid_ISBN", c("Valid ISBN", "Invalid ISBN")),
+  t_nice("Difference in means - Books only in ratings dataset", BX, "mean_rating", c("BX-ratings","BX-joint"), "source")
+) %>%
+  kable(caption = "Significance test results", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+
+```
+
+```{r BX_ratings, echo=F}
+BXR.overview
+BXR.ISBNs
+BXR.ISBNsTests
+```
+# Exploring the combined book datasets
+## Overlap of datasets
+Finally, I can combine datasets and explore them. 
+
+First, let's take a look at a simple overlap of the datasets. 40% of the ISBNs found in the Book Crossing dataset were matched to a corresponding one in Goodreads dataset (including a few invalid ones!). It's a lower match rate than I would have expected in advance, and there can be a few explanations for it. The Goodreads dataset I am working with is incomplete - based on the details provided on authors' website, they only scraped information about books presented on the public shelves of Goodreads. According to [Wikipedia](https://en.wikipedia.org/wiki/Goodreads) (no more up-to-date sources were found), Goodreads had 20M books in 2007 (vs. 2.3M available in this dataset). 
+
+It also possible that Book Crossing includes genuinely more "unique books" - but that's something to explore later on. The statistics of # of ratings on both platforms indicate that the books that are available on both platforms are more often reviewed than the books that are on one of the platforms only, indicating they are indeed more popular.
+
+Second, the average ratings show some differences. Books that appear only on Book Crossing appear to have lower average rating than the ones that are also on Goodreads. In Goodreads dataset, the reverse is observed - books appearing only on Goodreads are more highly valued. These differences are statistically significant at 5%.
+
+On the first glance, this means I do not need to worry about 1M records missing ISBN numbers in Goodreads dataset. These books are, on average, more highly rated than the matched Goodreads books; and the matched Goodreads books are more highly rated on Book Crossing than the ones that were not matched from Book Crossing dataset. That would make it quite unlikely that there's an overlap between the two (at least on the rating basis alone). However, this line of thinking is based on an implicit assumption that ratings on both sites are similar in nature. Are they? Well, looking only at books that received at least 10 reviews on both sites, there definitely are similarities - correlation coefficient is 59.6%. At least at this stage, data quality does not appear to be a major issue to proceed further.
+```{r combine_books, echo=F, eval=F}
+#combine the datasets
+Books = merge(BX, GR_books_clean, all=T)
+Books[, presence := ifelse(is.na(book_id), "bx", ifelse(is.na(source), "gr", "bx-gr"))]
+#clean up variable names
+Books[, valid_ISBN := ifelse(is.na(valid_ISBN.x), valid_ISBN.y, valid_ISBN.x)]
+Books[, publication_year := ifelse(is.na(`Year-Of-Publication`), pub_year, `Year-Of-Publication`)]
+Books[, c("valid_ISBN.x","valid_ISBN.y", "pub_year", "Year-Of-Publication"):=NULL]
+
+setnames(Books, "mean_rating", "bx_avg_rating")
+setnames(Books, "rating_count", "bx_ratings_count")
+setnames(Books, "average_rating", "gr_avg_rating")
+setnames(Books, "text_reviews_count", "gr_text_review_count")
+setnames(Books, "ratings_count", "gr_ratings_count")
+
+
+#Calculate metrics
+B.table = 
+  Books[, list(
+  N=.N, 
+  bx_avg_rating=mean(bx_avg_rating, na.rm = T),
+  bx_avg_count=mean(bx_ratings_count, na.rm = T),
+  bx_median_count=median(bx_ratings_count, na.rm = T),
+  gr_avg_rating=mean(gr_avg_rating, na.rm = T),
+  gr_avg_count=mean(gr_ratings_count, na.rm = T),
+  gr_median_count=median(gr_ratings_count, na.rm = T)
+), by=list(presence, valid_ISBN)][order(presence, valid_ISBN)]
+
+write_rds(Books, paste0(rds_path, "Books.rds"))
+
+#t-tests
+B.ttests = 
+  bind_rows(
+  t_nice("Difference in # of BX ratings among bx & gr-bx books", Books, "bx_ratings_count", c("bx", "bx-gr"), "presence"),
+  t_nice("Difference in BX ratings among bx & gr-bx books", Books, "bx_avg_rating", c("bx", "bx-gr"), "presence"),
+  t_nice("Difference in # of GR ratings among gr & gr-bx books", Books, "gr_ratings_count", c("gr", "bx-gr"), "presence"),
+  t_nice("Difference in GR ratings among gr & gr-bx books", Books, "gr_avg_rating", c("gr", "bx-gr"), "presence")
+)
+
+B.correl =
+  cor(
+    Books[presence == "bx-gr" & !is.na(bx_avg_rating) & !is.na(gr_avg_rating) & bx_ratings_count > 10 & gr_ratings_count > 10, list(bx_avg_rating, gr_avg_rating)]
+  ) [1,2]
+
+B.chart = 
+  Books[presence == "bx-gr" & !is.na(bx_avg_rating) & !is.na(gr_avg_rating) & bx_ratings_count > 10 & gr_ratings_count > 10, ] %>%
+ggplot(aes(x=gr_avg_rating, y=bx_avg_rating)) + 
+  geom_point() + 
+  geom_smooth(method='lm', formula= y~x) + ggtitle(paste("Correlation between BX and GR ratings: ", percent(B.correl, digits=1)))
+
+#remove unnecessary variables to save memory
+rm(BX)
+rm(BX_ratings)
+rm(GR_books_clean)
+
+```
+
+```{r combined_books_EDA, echo=F}
+
+B.table %>%
+  kable(caption = "Overlap between Book Crossing and Goodreads datasets", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+B.ttests %>%
+  kable(caption = "Significance test results", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+B.chart
+
+
+```
+
+## (Volume of) ratings over time
+The BX dataset was collected in mid 2004 whereas the Goodreads one - in 2017, so it is important to understand how the two datasets compare over time, including any rating trends. As the graphs below show, the majority of the books in the GR dataset were published after 2005. There appears to be some "ratings inflation" in both datasets with books that were published just a few years before the datasets were collected having higher averate ratings (and significantly more ratings, too).
+
+Interestingly, the books that are present on BX generally have higher ratings the older they are. That applies to both subsets that are available on Goodreads and not. However, the books that only are available in the Goodreads dataset do not display this pattern.
+
+```{r BX_EDA, echo=F, eval = F}
+
+if(!exists("Books")) {
+  Books = read_rds(paste0(rds_path, "Books.rds"))
+}
+
+#statistics by publication year and presence category
+hist_by_year = Books[
+  !is.na(publication_year) & between(publication_year, 1950, 2018), 
+  list(N=.N, 
+       bx_rating=mean(bx_avg_rating, na.rm = T),
+       bx_count=sum(bx_ratings_count, na.rm = T), 
+       gr_rating=mean(gr_avg_rating, na.rm = T), 
+       gr_count=sum(gr_ratings_count, na.rm = T)
+  ),
+  by=list(publication_year, presence)
+]
+
+#clean up empty means
+hist_by_year[is.nan(bx_rating), bx_rating := NA][is.nan(gr_rating), gr_rating := NA]
+
+#statistics by publication year only
+h2 = hist_by_year[, 
+  list(
+    bx_r_per_book=sum(bx_count, na.rm = T) / sum(N),
+    gr_r_per_book=sum(gr_count, na.rm = T) / sum(N)
+  ),
+  by=publication_year
+]
+
+#proportion on goodreads
+h3 = hist_by_year[presence != "bx", list(N=sum(N), BX=sum(ifelse(presence == "bx-gr", N, 0))), by=publication_year][publication_year<2005, prop := BX / N]
+
+scale_factor = max(hist_by_year$N) / 5
+
+Ratings.chart1 = 
+ggplot(hist_by_year) + 
+  geom_col(aes(x=publication_year, y=N, fill=presence)) + 
+  geom_line(data=h3, mapping=aes(x=publication_year, y=prop*max(hist_by_year$N))) +
+  scale_y_continuous(name="Number of books", sec.axis=sec_axis(~./max(hist_by_year$N), name="Proportion of BX books on Goodreads")) + 
+  theme(legend.position = "bottom") +
+  ggtitle("# of books by publication year")
+
+Ratings.chart2a = 
+  ggplot(h2) + 
+  geom_line(aes(x=publication_year, y=gr_r_per_book)) + 
+  theme(legend.position = "bottom") +
+  ggtitle("# of Goodreads ratings/book")
+
+Ratings.chart2b = 
+  ggplot(h2) + 
+  geom_line(aes(x=publication_year, y=bx_r_per_book)) + 
+  theme(legend.position = "bottom") +
+  ggtitle("# of BX ratings/book")
+
+Ratings.chart3 = 
+ggplot(hist_by_year[N>50, ]) + 
+  geom_line(aes(x=publication_year, y=gr_rating, color=presence, linetype="Goodreads average rating"), size = 1.5) +
+  geom_line(aes(x=publication_year, y=bx_rating/2, color=presence, linetype="BX average rating")) + 
+  scale_y_continuous(name="", sec.axis=sec_axis(~.*2, name="")) + 
+  labs(linetype = "") +
+  theme(legend.position = "bottom") +
+  ggtitle("Avg. book ratings by publication year") +
+  facet_wrap(~presence, nrow=1)
+```
+
+```{r ratings_EDA, echo=F}
+Ratings.chart1
+grid.arrange(Ratings.chart2a, Ratings.chart2b, nrow=1)
+Ratings.chart3
+```
+
+
+## Distribution of ratings, ratings count and ratings vs. rating count
+
+Let's take a deeper look at average ratings and number of ratings that the Books in the dataset have. Here are a few takeaways based on the below analysis:
+
+* Goodreads average book ratings are pretty much normally distributed with some skewness to the left.
+* Book Crossing average book ratings do not look normally distributed at all. This, however, appears to be due to lack of rating data. When limiting the analysis to books with > 10 reviews, the distribution looks more normal. Interestingly, this only applies to books that are also found on Goodreads, and not the "unique" Book Crossing books.
+* Effective rating scale is limited on both sites. On Goodreads, most books are rated between 2.5 and 5 on average (full range is 1-5). On Book Crossing (limiting data to books with 10+ reviews), the range is 6-9 (full range is 1-10). This is important to remember when comparing mean differences which, on the face of it, appear minimal (e.g. 0.3 point). On a limited scale, it matters!
+* There seems to be no relationship between rating counts and average ratings on either of the sites. However, it is clearly visible how books coverge to the more limited rating range as they get more reviews. In both cases, the converge is more pronounced for low-rated books.
+
+```{r explore_ratings, echo=F, eval=F}
+
+Ratings.p1 = 
+  Books[!is.na(gr_avg_rating), ] %>%
+  ggplot(aes(x=gr_avg_rating, color=presence, fill=presence)) +
+  geom_histogram(aes(y=..density..), position="identity", alpha=0.2, bins=25)+
+  #geom_density(alpha=0.3)+
+  labs(title="Goodreads",x="Average rating", y = "Density")
+ 
+Ratings.p2 = 
+  Books[!is.na(bx_avg_rating), ] %>%
+  ggplot(aes(x=bx_avg_rating, color=presence, fill=presence)) +
+  geom_histogram(aes(y=..density..), position="identity", alpha=0.2, bins=25)+
+  #geom_density(alpha=0.3)+
+  labs(title="Book Crossing",x="Average rating", y = "Density")
+
+Ratings.p22 = 
+  Books[!is.na(bx_avg_rating) & bx_ratings_count > 10, ] %>%
+    ggplot(aes(x=bx_avg_rating, color=presence, fill=presence)) +
+    geom_histogram(aes(y=..density..), position="identity", alpha=0.2, bins=25)+
+    #geom_density(alpha=0.3)+
+    labs(title="Book Crossing (rating_count > 10)",x="Average rating", y = "Density")
+
+Ratings.p3 = 
+  Books[!is.na(gr_ratings_count), ] %>%
+  ggplot(aes(x=gr_ratings_count+1, color=presence, fill=presence)) +
+  geom_histogram(aes(y=..density..), position="identity", alpha=0.2, bins=25) +
+  scale_x_continuous(trans='log2') +
+  labs(title="Goodreads rating count (log)",x="# of ratings", y = "Density")
+
+Ratings.p4 = 
+  Books[!is.na(bx_ratings_count), ] %>%
+  ggplot(aes(x=bx_ratings_count + 1, color=presence, fill=presence)) +
+  geom_histogram(aes(y=..density..), position="identity", alpha=0.2, bins=50) +
+  scale_x_continuous(trans='log2') +
+  labs(title="Book Crossing rating counts (log)",x="# of ratings", y = "Density")
+
+Ratings.p5 = 
+  Books[!is.na(gr_ratings_count) & !is.na(gr_avg_rating), ] %>%
+  ggplot(aes(x=gr_ratings_count+1, y=gr_avg_rating)) +
+  geom_point(size = 0.1) +
+  scale_x_continuous(trans='log2') +
+    labs(title="Goodreads", x="# of ratings", y = "Average rating")
+
+Ratings.p6 = 
+  Books[!is.na(bx_ratings_count) & !is.na(bx_avg_rating), ] %>%
+  ggplot(aes(x=bx_ratings_count+1, y=bx_avg_rating)) +
+  scale_x_continuous(trans='log2') +
+  geom_point(size = 0.1) +
+  labs(title="Book Crossing", x="# of ratings", y = "Average rating")
+
+```
+
+```{r ratings_charts, echo=F}
+grid.arrange(Ratings.p1, Ratings.p2, Ratings.p22, nrow=2, top=textGrob("Average rating distributions", gp=gpar(fontsize=20,font=3)))
+grid.arrange(Ratings.p3, Ratings.p4, nrow=1)
+grid.arrange(Ratings.p5, Ratings.p6, nrow=1, top=textGrob("Relationship between average rating and # of ratings", gp=gpar(fontsize=20,font=3)))
+```
+
+# Author-level data
+Next, let's explore what the data tells us about the authors. I will rely on Goodreads author data, filling in unknowns with Book Crossing author data where applicable. First, let's take a look at the most popular authors on both platforms. While the top 10 lists have similarities (Stephen King, J.K. Rowling, others), they are not the same. 
+
+To further understand the differences, I present them on a relative basis, that is:
+
+* I compare the %-share of total ratings that authors have on each platform and present the top/bottom 10;
+* I compare the differences in z-standardized average ratings that authors have on each platform and present the top/bottom 10.
+
+The %-rating share lists are really interesting (at least if you ask me!). The top 10 authors that are relatively more popular on Goodreads are all really well known names: J.K.Rowling, G.Orwell, G.R.R. Martin, Shakespeare, Dan Brown.. This implies that such household-name authors are relatively less popular on Book Crossing, suggesting that Book Crossing may have a more diverse book universe. I have to note that in some cases, this may also be a result of the timing differences between the two datasets. For example, G.R.R. Martin saw his moment of fame with Game of Thrones in 2010's, well after Book Crossing dataset was collected. It unfortunalely only remains a speculation if these results represent a "renaissance" for some other authors, too (e.g. G.Orwell). 
+
+At a risk of demonstrating my lack of sophistication, I would say that the other side of the list contains less known authors. John Grisham, the most overrepresented author in Book Crossing is an American novelist, popular for his legal thrillers. Nora Roberts is an American author of more than 225(!) romance novels. 
+
+A couple of hypotheses come to my mind when looking at these results. First, it's possible that Book Crossing dataset is more dominated by data from the US. As of today, though, Book Crossing website states that only [29% of their users come from USA](https://www.bookcrossing.com/about). Goodreads, on the other hand, back in 2017, wrote that nearly [50% of their active users come from the USA](https://www.goodreads.com/author_blog_posts/14538341-who-is-the-average-goodreads-user-you-ll-be-surprised). So this hypothesis does not seem to be right. Second, the top 10 authors that are overrepresented on Book Crossing appear to primarily be into writing romance and thriller novels. Perhaps the two datasets really differ from the perspective of genres? I will explore that later.
+
+The list of top authors by average rating difference is almost empty of very famous names, save for J.R.R. Tolkien, who seems to be preferred by the Goodreads crowd. I leave the reader to explore the list - I can only say that the list of authors that are preferred on Book Crossing seems to be quite obscure (Helene Siegel, for example, appears to be behind a series of cookbooks focusing on individual ingredients, e.g. garlic).
+
+```{r authors, echo=F, eval=F}
+#read in book to author map
+author_book_map = vroom(paste0(goodreads_path, "goodreads_parsed_books_authors.csv"), delim = ",", col_types ="ii")
+#read in author details
+input = file(paste0(goodreads_path, "goodreads_book_authors.json"), open="r")
+Authors = stream_in(input) %>% as.data.table()
+close(input)
+
+#merge the two files
+setDT(author_book_map)
+setkey(author_book_map, author)
+Authors[, author_id := as.integer(author_id)]
+setkey(Authors, author_id)
+Authors = merge(author_book_map, Authors, by.y ="author_id", by.x="author", all.x=T)
+
+#merge everything with books
+setkey(Books, book_id)
+setkey(Authors, book_id)
+Books[Authors, c("author_rating", "author_rating_count", "author_review_count", "author_name") := list(average_rating, ratings_count, text_reviews_count, name)]
+
+#merge BX and GR author names
+Books[is.na(author_name) & !is.na(Author), author_name := Author]
+
+#get most popular authors on BX
+Auth.bx_books = 
+  Books[!is.na(author_name), 
+      list(
+        bx_total_ratings = sum(bx_ratings_count, na.rm=T), 
+        bx_average_rating = weighted.mean(bx_avg_rating, bx_ratings_count, na.rm = T)
+      ), 
+  by=list(author_name)][, 
+    c("bx_share_of_ratings", "bx_sd_rating") := list(
+      bx_total_ratings / sum(.SD$bx_total_ratings), (bx_average_rating - mean(.SD$bx_average_rating, na.rm = T)) / sd(.SD$bx_average_rating, na.rm = T)
+  )]
+
+#Most popular authors on GR
+Auth.gr_books = 
+  Books[!is.na(author_name), 
+      list(
+        gr_total_ratings = sum(gr_ratings_count, na.rm=T), 
+        gr_average_rating = weighted.mean(gr_avg_rating, gr_ratings_count, na.rm = T)
+      ), 
+  by=author_name][, 
+    c("gr_share_of_ratings", "gr_sd_rating") := list(
+      gr_total_ratings / sum(.SD$gr_total_ratings), (gr_average_rating - mean(.SD$gr_average_rating, na.rm = T)) / sd(.SD$gr_average_rating, na.rm = T)
+  )]
+
+#match up author statistics
+setkey(Auth.bx_books, author_name)
+setkey(Auth.gr_books, author_name)
+AuthorMix = merge(Auth.bx_books, Auth.gr_books, by="author_name")[!is.na(gr_total_ratings) & !is.na(bx_total_ratings), ]
+AuthorMix[, c("diff_rating", "diff_rating_count") := list(gr_sd_rating - bx_sd_rating, gr_share_of_ratings - bx_share_of_ratings)]
+
+#get top20 authors that differ the most by % of ratings and by popularity
+
+n = nrow(AuthorMix[bx_total_ratings > 10 & gr_total_ratings > 10, ])
+indices = c(1:10, c((n-10):n))
+Auth.top_diff_counts = AuthorMix[bx_total_ratings > 10 & gr_total_ratings > 10, ][order(diff_rating_count), ][indices, ]
+Auth.top_diff_rating = AuthorMix[bx_total_ratings > 10 & gr_total_ratings > 10, ][order(diff_rating), ][indices, ]
+
+
+```
+
+```{r authors_EDA, echo=F}
+Auth.bx_books[order(bx_total_ratings, decreasing = T), ][1:10, 1:3] %>%
+  kable(caption = "Top 10 most popular authors on Book Crossing", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+Auth.gr_books[order(gr_total_ratings, decreasing = T), ][1:10, 1:3] %>%
+  kable(caption = "Top 10 most popular authors on Goodreads", format="html") %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+Auth.top_diff_counts %>% lazy_dt() %>% arrange(diff_rating_count) %>%
+  mutate(author_name=factor(author_name, levels=author_name)) %>% as_tibble() %>%
+  ggplot() + 
+  geom_col(
+    aes(x=author_name, y=diff_rating_count, fill=ifelse(diff_rating_count > 0, "Higher rating share on GR", "Higher rating share on BX")
+    )
+  ) +
+  labs(fill = "", y="Difference in rating share", x="Author") +
+  scale_y_continuous(labels = scales::percent) + 
+  ggtitle("Relative popularity (share of total ratings) of authors") + coord_flip()
+
+Auth.top_diff_rating %>% lazy_dt() %>% arrange(diff_rating) %>%
+  mutate(author_name=factor(author_name, levels=author_name)) %>% as_tibble() %>%
+  ggplot() + 
+  geom_col(
+    aes(x=author_name, y=diff_rating, fill=ifelse(diff_rating > 0, "Higher avg. rating on GR", "Higher avg. rating on BX")
+    )
+  ) +
+  labs(fill = "", y="Difference in avg. rating", x="Author") +
+  ggtitle("Relative popularity (based on average rating score) of authors") + coord_flip()
+
+```
+
+# Genres
+
+## Existing data
+The last component to add to the analysis are book genres. One of my hypothesis is that certain *types* of books are more likely to end up on Book Crossing than ones - in particular, "light reads" (e.g. romance), or books that a person can outgrow (e.g. children books). The top/bottom author list just explored earlier seem to provide some support for this hypothesis.
+
+Neither of the data sources have a fixed genre taxonomy, but Goodreads users can classify their books into shelves. Shelves can be used for many purposes (I personally once kept a shelf for potential Christmas presents), but most users use it as a tagging system for genres. The researchers at UCSD include two pieces of information related to shelves. One is the raw data (i.e. most popular shelves associated with each book), and the other one is pre-processed "genre-like" classification indicating how many times a book was put into one of 10 pre-determined categories. According to the documentation of their website, the 10 categories were determined by a "simple keyword matching" process.
+
+The ideal approach would be to use the raw shelves' data and topic modelling approaches to determine genres. Due to the computation complexity involved, however, I will opt to work with the 10-category dataset instead.
+
+Upon loading the genre dataset, I can see that the fiction category dominates the dataset. However, I have a suspicion that this is not necessarily a genre per se (after all, all books can be classified as fiction or non-fiction). Plotting the histogram of the most popular shelf for each book confirms it - while fiction remains the most popular category, the dynamics change quite a bit.
+
+This leads me to thinking that I would benefit from creating more nuanced categories than these. Effectively, I would like to cluster the books based on their shelf counts, and ideally have more than 10 clusters. This would, as mentioned before, be better done while working with raw data, but let's see what happens.
+
+```{r load_genres, echo=F, eval=F}
+input = file(paste0(goodreads_path, "goodreads_book_genres_initial.json"), open="r")
+GR_genres = stream_in(input) %>% as.data.table()
+GR_genres[, book_id := as.integer(book_id)]
+
+#prettify the genre names
+setnames(GR_genres, colnames(GR_genres)[2:11],
+  c("history-biography", "fiction", "fantasy-paranormal",
+    "mystery-crime", "poetry", "romance", "non-fiction",
+    "children", "young-adult", "comics-graphic")         
+)
+close(input)
+
+#calculate total number of shelf attributions per book
+GR_genres[, total := rowSums(.SD, na.rm = T), .SDcols=2:11]
+
+#Take the entries that have at 1 rating and transform into a "narrow & long" dataset
+DT = melt(GR_genres[total > 0,], id.vars = c("book_id", "total"), measure.vars = 2:11)
+#replace na's to 0 (original encoding of the dataset)
+DT[is.na(value), value :=0]
+
+#Exclude books that have shelf entries with negative numbers. This must be an data transformation issue in the original dataset.
+negative_values = DT[value < 0, list(neg=1), by=book_id]
+setkey(negative_values, book_id)
+setkey(DT, book_id)
+DT_non_neg = merge(DT, negative_values, all.x=T)[is.na(neg),]
+
+#calculate proportion of each shelf for each book
+DT_non_neg[, prop := value / total]
+
+#revert into "wide" format with each shelf as a column
+GR_Genres_final = dcast(DT_non_neg, book_id + total ~ variable, value.var = "prop")
+write_rds(GR_Genres_final, paste0(rds_path, "GR_genres_final.rds"))
+
+#simple distribution chart
+G.p1 = 
+  DT_non_neg[, sum(value), by=variable] %>% 
+  ggplot(aes(x=variable, y=V1, fill=variable)) + geom_col() + 
+  labs(x="Categories", y="Total shelf count") + 
+  coord_flip() + scale_fill_manual(values=brewer.pal(n=10, name = "Set3")) + theme(legend.position = "none")
+
+#dominating genre
+DT_non_neg[, max_value := max(value), by=book_id]
+
+G.p2 =
+  DT_non_neg[max_value == value, ][, .N, by=variable] %>%
+  ggplot(aes(x=variable, y=N, fill=variable)) + geom_col() + 
+  labs(x="Categories", y="Most popular shelf count") + 
+  coord_flip() + scale_fill_manual(values=brewer.pal(n=10, name = "Set3")) 
+
+#cleanup
+rm(DT_non_neg)
+rm(DT)
+rm(negative_values)
+rm(GR_genres)
+```
+
+```{r show_genres, echo=F}
+grid.arrange(G.p1, G.p2, nrow=2)
+```
+
+## Generating genre clusters
+
+To find clusters in genre/category data, I will use k-means algorithm. I will run several iterations to find the best hyperparameter combination where my hyperparameters will be:
+
+* Number of clusters (will test values 5-25).
+* Cut-off values for total # of shelf-counts (will test values 0-10). The motivation behind this hyperparameter is to check if exclusion of books with only a few shelf counts significantly improve clustering performance.
+
+To avoid issues with a large variances in # of shelf categorizations a book may have, I will use proportions instead (i.e. my features are a % of times each book was placed in the 10 predetermined categories).
+
+The assessment of the clusters was done using two metrics:
+
+* Silhouette score, which effectively calculates the similarity of each data point to other data points in the same cluster vs. data points in the nearest cluster. I will specifically only look at mean silhouette score across all clusters. To reduce computation time, scores will be computed based on a random sample of 10,000 records and averaged over 5 such samples.
+* Davies-Bouldin index, which measures how distinct clusters are (based on their centroid positions).
+
+A shout-out goes to [this article](https://gdcoder.com/silhouette-analysis-vs-elbow-method-vs-davies-bouldin-index-selecting-the-optimal-number-of-clusters-for-kmeans-clustering/) which was very helpful in understanding the two metrics.
+
+I present the results of the clustering below. Across all shelf cut-off points, silhouette scores tended to peak at ~10th cluster indicating the original genre categories weren't a bad choice. The Davies-Boulding index, typically, trended down with more clusters. Overall, the differences in the metrics are not large. I thus choose a safe "middle" ground - a clustering resul that maximizes the result of both metrics combined - which ends up being a model with min_ratings = 10 and K = 16.
+
+
+```{r, genre_clustering, code=F, eval=F}
+if(!exists("GR_Genres_final")) {
+  GR_Genres_final = read_rds(paste0(rds_path, "GR_genres_final.rds"))  
+}
+
+# Function calculating Davies-Bouldin Index (https://en.wikipedia.org/wiki/Davies%E2%80%93Bouldin_index)
+davies_bouldin = function(result, k) {
+  max_dists = sapply(1:k, function(cluster) {
+    dists = sapply(1:k, function(neighbour) {
+      if (cluster == neighbour) {
+        return(0)
+      } else {
+        avg_dist_cluster = result$withinss[cluster] / result$size[cluster] 
+        avg_dist_neighbour = result$withinss[neighbour] / result$size[neighbour]
+        dist_between_clusts = sum((result$centers[cluster, ] - result$centers[neighbour, ])^2)
+        return (avg_dist_cluster + avg_dist_neighbour) / dist_between_clusts
+      }
+    })
+    max(dists)
+  })
+  mean(max_dists)
+}
+
+#Silhouette score calculation
+#To reduce computation time, 5 samples of 10000 elements are run and mean score is returned
+silhouette_score = function(result, dt) {
+  scores = sapply(1:5, function(x) {
+    set.seed(x)
+    sub_sample = sample(nrow(dt), 10000)
+    sihls = silhouette(result$cluster[sub_sample], dist(dt[sub_sample, ]))
+    mean(sihls[, 3])  
+  })
+  mean(scores)
+}
+
+#sampling code for testing
+set.seed(18610410)
+sample = 1:nrow(GR_Genres_final)
+#sample = sample(nrow(GR_Genres_final), 100000)
+
+run_kmeans = function(sample, min_rating_list, k_list, cores, calc_silhouette = T) {
+  lapply(min_rating_list, function(min_ratings) {
+      mclapply(k_list, function(k){
+        #print(paste("Starting kmeans with", k, "and", min_ratings))
+        set.seed(18610410)
+        result = kmeans(GR_Genres_final[sample, ][total >= min_ratings, 3:12], centers = k, nstart=5, iter.max = 1000) 
+        c(k=k, 
+          min_ratings = min_ratings,
+          elbow = result$tot.withinss, 
+          davies_bouldin = davies_bouldin(result, k),
+          silhouette=ifelse(calc_silhouette, silhouette_score(result, GR_Genres_final[sample, ][total >= min_ratings, 3:12]), NA) 
+        )
+      }, mc.cores = cores, mc.silent = F) 
+  })  
+}
+
+#run K-means. Go get a coffee. Or two.
+s = run_kmeans(sample=sample, min_rating_list=1:10, k_list=5:25, cores=2, calc_silhouette = T)
+
+#save scores to disk for future reference
+scores = do.call(rbind, lapply(s, function(x) simplify2array(x) %>% t())) %>% as_tibble() %>% mutate(weighted = silhouette - davies_bouldin)
+write_rds(scores, paste0(rds_path, "kmeans_scores.rds"))
+```
+
+
+```{r, genre_clustering_results, code=F, eval=F}
+
+if(!exists("scores")) {
+  scores = read_rds(paste0(rds_path, "kmeans_scores.rds"))  
+}
+
+#calcs for charts
+best = scores %>% 
+  group_by(min_ratings) %>% 
+  summarize(max_s = max(silhouette), min_db = min(davies_bouldin), max_weighted = max(weighted), .groups="drop_last")
+
+best_k = scores %>% group_by(min_ratings) %>% filter(weighted == max(weighted))
+
+#plot # of observations remaining with min_rating condition
+G.min_ratings = 
+  bind_cols(
+    as_tibble_col(1:10, column_name = "min_ratings"),
+    sapply(1:10, function(x) {
+      GR_Genres_final[total >= x, .N]
+    }) %>% as_tibble_col(column_name = "observations") 
+  ) %>%
+  ggplot() + geom_col(aes(x=min_ratings, y=observations)) + ggtitle("Number of books with >= of specified ratings")
+
+#plot kmeans scores
+G.scores = 
+  scores %>%
+  pivot_longer(cols=-c("k", "min_ratings")) %>% 
+  filter(name != "elbow") %>%
+  ggplot() + geom_line(aes(x=k, y=value, color=name)) + geom_point(aes(x=k, y=value, color=name)) +
+  #dashed lines for per-rating best scores
+  geom_hline(data = best, aes(yintercept=max_s, color="silhouette"), linetype="dashed") +
+  geom_hline(data = best, aes(yintercept=min_db, color="davies_bouldin"), linetype="dashed") +
+  geom_hline(data = best, aes(yintercept=max_weighted, color="weighted"), linetype="dashed") +
+  #dotted lines for overall best scores
+  #geom_hline(data = best, aes(yintercept=max(max_s), color="silhouette"), linetype="dotted") +
+  #geom_hline(data = best, aes(yintercept=min(min_db), color="davies_bouldin"), linetype="dotted") +
+  #geom_hline(data = best, aes(yintercept=max(max_weighted), color="weighted"), linetype="dotted") +
+  #best choice per rating
+  geom_vline(data = best_k, aes(xintercept=k), linetype="dashed") + 
+  geom_label(data = best_k, aes(x=k+1, y=0, label=paste0("K=",k, "; W=", percent(weighted)))) +
+  #geom_label(data = best_k, aes(x=k+4, y=silhouette, label=paste0("K=",k, "; SH=", percent(silhouette)))) +
+  #geom_label(data = best_k, aes(x=k+4, y=davies_bouldin, label=paste0("K=",k, "; DB=", percent(davies_bouldin)))) +
+  NULL
+
+```
+
+```{r genre_clustering_results_plot, echo=F, fig.height=10, fig.width=10}
+G.scores + facet_wrap(~min_ratings, ncol=3)
+```
+
+
+## Exploring genre clusters
+Below I present the generated clusters. As it would be expected, a single category typically dominates a cluster, but some meaningful combinations help differentiate substyles (e.g. clusters 3 and 4, where history/biography is the dominating category, but one is leaning towards fiction, and the other one - towards non-fiction).
+
+I also tried a principal component analysis to visualize the clusters in a 2-dimensional space. The first two principal components account only for 30% of the variance, but one can see some logical patterns (e.g clusters 1 (fantasy/paranormal) and 12 (non-fiction) are nearly opposite to each other).
+
+```{r genre_cluster_finalization, echo=F, eval=F}
+if(!exists("GR_Genres_final")) {
+  GR_Genres_final = read_rds(paste0(rds_path, "GR_genres_final.rds"))  
+}
+
+#run kmeans with optimal parameters
+final_K = 16
+final_cutoff = 10
+set.seed(18610410)
+result = kmeans(GR_Genres_final[total >= final_cutoff, 3:12], centers = final_K, nstart=5, iter.max = 1000) 
+
+#get nice cluster names
+clusters =
+  bind_cols(
+    as_tibble_col(1:final_K, column_name="cluster"),
+    as_tibble(result$centers),
+    apply(
+      result$centers, 1,
+      function(x) {
+          x = sort(x, decreasing = T)
+          i = which(x > 0.25)
+          names = names(x[i])
+          values = paste0(round(x[i]*10,0)*10, "%")
+          str_flatten(paste(names, values), collapse=" | ")
+      }
+    ) %>% as_tibble_col(column_name = "cluster_name")
+  ) %>% as.data.table()
+setkey(clusters, cluster)
+
+#join with genres dataset
+Genres = copy(GR_Genres_final[total >= final_cutoff, ])
+Genres[, cluster:= result$cluster]
+setkey(Genres, cluster)
+Genres[clusters, cl_name := cluster_name]
+
+#run PCA
+setkey(Genres, book_id)
+pca = prcomp(Genres[, 3:12], scale = TRUE, center = TRUE)
+
+#display first 2 PC's
+dt = pca$x[, 1:2] %>% as_tibble() %>% #grab first 2 PCAs
+    bind_cols(as_tibble_col(result$cluster, column_name = "cluster")) %>% #add cluster numbers from kmeans
+    inner_join(clusters[, list(cluster, cluster_name)], by="cluster") 
+
+#plot centroids of each cluster
+G.cluster_plot = 
+  clusters %>% 
+    pivot_longer(-c(cluster_name, cluster)) %>%
+    ggplot() + geom_col(aes(x=name, y=value, fill=name), position="dodge") + 
+    scale_x_discrete(breaks=NULL) + scale_y_continuous(breaks = NULL) + 
+    xlab("") + ylab("Frequency") + theme_bw() + theme(legend.position = "bottom") + 
+    scale_fill_manual(values=brewer.pal(n=10, name = "Set3")) + 
+    facet_wrap(~ cluster, ncol = 4) + ggtitle("Cluster visualization by dominating category")
+
+#plot PCA results
+G.pca_plot = 
+dt %>% 
+  slice_sample(n=10000) %>% 
+  ggplot() + geom_point(aes(x=PC1, y=PC2), size=0.2) + facet_wrap(~ cluster_name, ncol=4) +
+  scale_x_discrete(breaks=NULL) + scale_y_continuous(breaks = NULL) + ggtitle("Cluster visualization in a 2-dimensional space") +
+  theme(strip.text.x = element_text(size = 6))
+
+rm(dt)
+rm(pca)
+rm(GR_Genres_final)
+```
+
+```{r genre_cluster_finalization_EDA, echo=F}
+G.cluster_plot
+G.pca_plot
+```
+
+
+## Presence of genres across the two sites
+Let's compare if there are significant differences between prevalence of the genres across the two sites. Goodreads have, proportionally, many more fantasy-paranormal, young adult, romance, and comics-graphic genre books. Book Crossing, on the other hand, appears to be dominated by mystery crime novels and fiction. My previous hypothesis does not really hold (children, romance books appear to be more popular on Goodreads), but there are clear differences in proportions (all of which, including poetry are statistically significant at 5%).
+```{r genre_presence_calc, echo=F, eval=F}
+#Merge Genres and Books
+setkey(Books, book_id)
+setkey(Genres, book_id)
+Books[Genres, c("cluster", "cluster_name") := list(cluster, cl_name)]
+
+genre_counts =
+  cluster_presence = 
+  Books[!is.na(cluster), list(bx_count = sum(bx_ratings_count, na.rm = T), gr_count = sum(gr_ratings_count, na.rm = T)), by=cluster_name]
+
+genre_counts.bx_total = sum(genre_counts$bx_count)
+genre_counts.gr_total = sum(genre_counts$gr_count)
+
+significance_of_diffs = apply(genre_counts, 1, function(genre) {
+  bxc = as.integer(genre[["bx_count"]])
+  grc = as.integer(genre[["gr_count"]])
+  l = list()
+  l[[genre[["cluster_name"]]]] = prop.test(matrix(c(bxc, grc, genre_counts.bx_total - bxc, genre_counts.gr_total - grc), nrow=2, ncol=2))
+  l
+})
+
+cluster_presence = genre_counts %>% lazy_dt() %>% 
+  mutate(bx_count = bx_count / sum(bx_count), gr_count = gr_count / sum(gr_count)) %>% 
+  mutate(diff = gr_count - bx_count) %>%
+  as_tibble()
+
+#plot genre differences
+G.presence = 
+  cluster_presence %>% arrange(diff) %>%
+  mutate(cluster_name=factor(cluster_name, levels=cluster_name)) %>% 
+  ggplot() + 
+  geom_col(
+    aes(x=cluster_name, y=diff, fill=ifelse(diff > 0, "Higher proportion on GR", "Higher proportion on BX")
+    )
+  ) +
+  labs(fill = "", y="Difference in proportion", x="Genre") +
+  ggtitle("Relative popularity of genres") + coord_flip()
+```
+
+```{r genre_proportion_chart, echo=F}
+G.presence
+```
+
+## Book popularity (rating scores) in different genres
+Do the popularity of genres differ across the two sites? Indeed they do. It seems that on Book Crossing, romance and young adult books do not have a great reputation, whereas on Goodreads that fame goes to mystery and crime books. Book Crossing users really like comics, though! (and everyone like poetry). 
+```{r genre_popularity_calc, echo=F, eval=F}
+#get cluster ratings
+cluster_ratings = 
+  Books[!is.na(cluster), list(bx_rating = mean(bx_avg_rating, na.rm=T), gr_rating = mean(gr_avg_rating, na.rm=T)), by=cluster_name]
+
+#zero-mean them
+cluster_ratings[, bx_rating := bx_rating - mean(bx_rating)][, gr_rating := gr_rating - mean(gr_rating)]
+
+#plot genre differences
+G.differences = 
+  melt(cluster_ratings, "cluster_name") %>%
+    ggplot() + geom_col(aes(x=cluster_name, y=value, fill=cluster_name)) + facet_wrap(~variable, nrow=2) + 
+    ylab("Average rating") + coord_flip() + 
+    scale_x_discrete(breaks=NULL) + 
+    #scale_y_continuous(breaks = NULL) + 
+    ggtitle("Difference in popularity by genre") + xlab("")
+
+```
+
+```{r genre_pop_chart, echo=F}
+G.differences
+```
+It is interesting that these lists are, to some degree, opposite to the relative proportions just analyzed earlier. Here is how it looks in combination. The correlation coefficients between proportion of genre rating counts and average genre rating is -41% on BookCrossing and -47% on Goodreads. Effectively, the more ratings of a particular genre there are on the site, the lower, on average, is the overall rating of the genre! The same relationship remains even if weighted average genre ratings are used instead (i.e. if genre rating is calculated taking into account number of individual ratings a book belonging to that genre has).
+
+```{r genre_mix, echo=F}
+genre_mix = inner_join(cluster_ratings %>% lazy_dt(), cluster_presence %>% lazy_dt(), by="cluster_name") %>% as_tibble()
+
+G.mix1 = 
+  genre_mix %>% 
+  ggplot(aes(x=gr_count, y=gr_rating)) + geom_point() + geom_smooth(method = "lm", se = FALSE, formula="y ~ x") +
+  labs(x="Genre proportion", y="Average genre rating") + ggtitle("Genres on Goodreads") +
+  ggrepel::geom_text_repel(aes(label=cluster_name), size=3)
+
+G.mix2 = 
+  genre_mix %>% 
+  ggplot(aes(x=bx_count, y=bx_rating)) + geom_point() + geom_smooth(method = "lm", se = FALSE, formula="y ~ x") +
+  labs(x="Genre proportion", y="Average genre rating") + ggtitle("Genres on BookCrossing") + 
+  ggrepel::geom_text_repel(aes(label=cluster_name), size=3)
+
+G.mix1
+G.mix2
+```
+
+
+# Understanding if Goodreads books that are on Book Crossing are lower rated
+
+Now we finally have all the components to answer the main question: is it so that people tend to share books they do not like on Book Crossing? This is a causal question (where "treatment" group are Goodreads books that ended up on Book Crossing), so I will approach it accordingly:
+
+* First, I will estimate propensity scores (i.e. likelihood of a book being on Book Crossing) using a logistic regression using available relevant variables. This on its own will be interesting to look at and see which variables have explanatory power.
+* Then, I will use the propensity scores to compare "similar" books and estimate the average treatment effect - the difference in scores between comparable Books that are vs. are not on Book Crossing (using Goodreads rating as a reference point)
+
+To answer this question, I will use Books that have at least 10 ratings on both sites (to avoid low quality data), I was able to estimate a genre cluster, and published between 1950 and 2005. My logistic regression model features include:
+
+* log(Goodreads rating count)
+* Publication year (mean-zero), modelled as year + year^2 to account for the popularity patterns seen when exploring the data.
+* log(Author rating count)
+* Genre clusters (categorical variable)
+
+Because my treatment and control groups are imbalanced, I will use a bootstrapping approach, whereby I will run the logistic regression a 1000 times, each time drawing an equally balance sample of the two groups of 10,000 records. 
+
+```{r propensity_scores, echo=F, eval=F}
+set.seed(18610410)
+Books[presence=="gr", treatment:=0][presence=="bx-gr", treatment:=1]
+dt = Books[!is.na(treatment) & !is.na(gr_ratings_count) & publication_year > 1950 & publication_year < 2005 * !is.na(cluster_name), ]
+dt[, year := publication_year - mean(publication_year)]
+dt[, log_rating_count := log(1 + gr_ratings_count)]
+dt[, log_author_count := log(1 + ifelse(is.na(author_rating_count), 0, as.integer(author_rating_count)))]
+dt[, year_squared := year * year]
+
+#balanced bootstrap
+balanced_model = function(sample_size, formula, iterations) {
+  #selected a balanced sample of the two classes
+  dt_sample = dt %>% lazy_dt() %>% group_by(treatment) %>% sample_n(10000, replace=T) %>% as_tibble()
+  #train logistic regression
+  glm(formula=formula, family=binomial(link = "probit"), data=dt_sample, maxit=iterations)
+}
+
+#run the balanced bootstrap 1000 times
+log_model = lapply(1:1000, function(i) {
+  balanced_model(10000, "treatment ~ year + year_squared + cluster_name + log_rating_count + log_author_count", 1000)
+})
+
+#calculate mean / sd / significance of coefficients
+mean_coeffs = apply(sapply(log_model, function(m) m$coefficients), 1, mean)
+sign_coeffs = apply(
+  sapply(log_model, function(m) m$coefficients),
+  1, 
+  function(x) {
+    r = t.test(x)
+    list(
+      "p.value" = r[["p.value"]],
+      "estimate" = r$estimate
+    )
+  }
+) %>% simplify2array() %>% t() %>% as_tibble(rownames = "parameter") %>% unnest(c("p.value", "estimate"))
+
+model_matrix = model.matrix(~ year + year_squared + cluster_name + log_rating_count + log_author_count, data=dt)[,]
+#calculate fitted values and various metrics
+fitted_values = pnorm(model_matrix %*% mean_coeffs) %>% as_tibble_col()
+rm(model_matrix)
+predictions = fitted_values > 0.5
+confusionMatrix = table(dt$treatment, predictions)
+
+metrics = tibble(
+  metrics = c("accuracy", "precision", "recall", "F1"),
+  values = c(
+    sum(diag(confusionMatrix)) / sum(confusionMatrix),
+    precision(confusionMatrix),
+    recall(confusionMatrix),
+    f1(confusionMatrix)  
+  )
+)
+
+```
+These are the results from the logistic regression:
+
+* All included features are statistically significant at with 99% confidence;
+* Genres have the most explanatory power, followed by book popularity (rating count). The impact of author popularity and year of publication is negligible. 
+* Among the genres, romance (and romance-mixed genres) as well as mystery-crime works have the largest impact on increasing the likelihood that a book will be on BookCrossing. Whereas comics and poetry books are less likely to show up on BookCrossing.
+
+While this logistic model is just an intermediate step in my analysis, it is interesting to see what is its performance. As illustrated below, it is has decent performance, with accuracy of 70%, precision of 57%, and recall of 69%. 
+
+```{r model_performance, echo=F}
+sign_coeffs %>% select(parameter, estimate, `p.value`) %>%
+  kable(
+    col.names = c("Feature", "coefficient",  "p-value"), 
+    caption="Logistic regression results", 
+    format="html"
+  ) %>%
+  column_spec(1, bold = T, border_right = T) %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+sign_coeffs %>% arrange(abs(estimate)) %>% 
+  mutate(parameter = factor(str_replace(parameter, "cluster_name", ""), levels=str_replace(parameter, "cluster_name", ""))) %>%
+ggplot() + 
+  geom_col(aes(x=parameter, y=estimate)) + 
+  coord_flip() + 
+  xlab("Feature") + ylab("Coefficient")
+
+metrics %>% 
+  kable(
+    col.names = c("Metric", "Value"), 
+    caption="Logistic regression performance", 
+    format="html"
+  ) %>%
+  column_spec(1, bold = T, border_right = T) %>%
+  kable_styling(bootstrap_options = "striped", full_width = T)
+
+#plot distributions
+model.controls = fitted_values[which(dt$treatment == 0), ] %>% as_tibble()
+model.treatment = fitted_values[which(dt$treatment == 1), ] %>% as_tibble()
+
+ggplot() + 
+  geom_histogram(aes(x=value), data=model.controls, bins=100, color="white", alpha=0.3, fill="blue") + 
+  geom_histogram(aes(x=value), data=model.treatment, bins=100, color="white", alpha=0.3, fill="red") + 
+  ggtitle("Distribution propensity scores in control and treatment classes") + xlab("Probability") + ylab("")
+```
+```{r test_impact_of_scores, echo=F, eval=F}
+dt[, ps_score := fitted_values]
+dt[, weight := ifelse(treatment == 1, 1 / ps_score, 1 / (1 - ps_score))]
+final_model = lm(gr_avg_rating ~ treatment, data=dt, weights=weight)
+```
+
+# Final results
+Once I have the propensity scores, I can finally answer the last question of this exploration: do the books that are on BookCrossing, everything else equal, have lower rating on Goodreads than the books that are not on BookCrossing? To answer this question, I use inversed probability weights derived from the propensity scores and run a weighted linear regression where the average book rating on Goodreads is the dependent variable and the presence of the book on Goodreads is an independent variable.
+
+As a reminder, early on in this exploration I found that books that are on BookCrossing had a ~0.05 lower rating on Goodreads than the books that are not. Turns out that this relationship holds even after adjusting for all the other factors above. The impact is slightly lower (~0.044), but, in practical terms, very close to what was observed before. So yes, it does seem that books that are lower rated have a higher likelihood to be shared via BookCrossing than otherwise.
+
+```{r final_results, echo=F}
+summary(final_model)
+```
+
+
+# Appendix: Parsing the original Goodreads books dataset
+The original *goodreads_books.json* file is 8.6GB in size and beyond the memory limits of the computer on which this analysis was performed. The schema of this dataset is quite rich and includes several attributes that are not relevant to the analysis (example record below).
+```
+{"isbn": "0312853122", "text_reviews_count": "1", "series": [], "country_code": "US", "language_code": "", "popular_shelves": [{"count": "3", "name": "to-read"}, {"count": "1", "name": "p"}, {"count": "1", "name": "collection"}, {"count": "1", "name": "w-c-fields"}, {"count": "1", "name": "biography"}], "asin": "", "is_ebook": "false", "average_rating": "4.00", "kindle_asin": "", "similar_books": [], "description": "", "format": "Paperback", "link": "https://www.goodreads.com/book/show/5333265-w-c-fields", "authors": [{"author_id": "604031", "role": ""}], "publisher": "St. Martin's Press", "num_pages": "256", "publication_day": "1", "isbn13": "9780312853129", "publication_month": "9", "edition_information": "", "publication_year": "1984", "url": "https://www.goodreads.com/book/show/5333265-w-c-fields", "image_url": "https://images.gr-assets.com/books/1310220028m/5333265.jpg", "book_id": "5333265", "ratings_count": "3", "work_id": "5400751", "title": "W.C. Fields: A Life on Film", "title_without_series": "W.C. Fields: A Life on Film"}
+```
+As some information was relevant for the intended analysis, a small streaming script was written to parse the original file and save it to a more compact version. jsonlite package's `stream_in` function and `vroom` package were used to benefit from their optimizations for such scenarios.
+```{r, book_file_parsing, echo=T, eval=F}
+input = file(paste0(goodreads_path, "goodreads_books_sample.json"), open = "r")
+output = file(paste0(goodreads_path, "goodreads_parsed_books_v2.csv"), open = "wb")
+append = F
+csv_writer = function(x) {
+  as_tibble(x) %>% 
+    select(book_id, authors) %>% unnest(authors) %>% 
+    lazy_dt() %>% filter(role == "") %>% group_by(book_id) %>% summarize(author = first(author_id)) %>% as.data.table() %>%
+    vroom_write(output, delim=",", append = append, progress = F, quote = "all", escape = "backslash", num_threads = 4)
+  append <<- T #switch append to true after the first iteration
+}
+stream_in(input, handler = csv_writer, pagesize = 10000)
+close(output)
+close(input)
+```
+
+Note that even this approach is quite time consuming. In the early stages of analysis, an even more crude approach that relied on unix command-line utilities was taken to retrieve only ISBN numbers (to confirm that there is a significant overlap between the two datasets). It was crude, but it was fast!
+```
+# To extract ISBNs from goodreads:
+cut -b "2-21" goodreads_books.json > isbns.tsv #extracts the beginning of each record that looks like "isbn": "XXXXXXXXXX"
+
+# cat -n command adds a line number (to be used afterwards in case need to read only specific .json lines)
+# sed command cleans up the output leaving only the ISBN number itself (or an empty line in case it is missing)
+cat -n isbns.tsv |sed -r 's/\"isbn\": \"([0-9]{9}(X|[0-9]))?(.*)/\1/' > clean_isbn.csv
+```
+
+# References
+
+1. Improving Recommendation Lists Through Topic Diversification, Cai-Nicolas Ziegler, Sean M. McNee, Joseph A. Konstan, Georg Lausen; Proceedings of the 14th International World Wide Web Conference (WWW '05), May 10-14, 2005, Chiba, Japan. To appear.
+2. Mengting Wan, Julian McAuley, "Item Recommendation on Monotonic Behavior Chains", in RecSys'18.
+3. Mengting Wan, Rishabh Misra, Ndapa Nakashole, Julian McAuley, "Fine-Grained Spoiler Detection from Large-Scale Review Corpora", in ACL'19. 
